@@ -20,36 +20,117 @@ process.title = 'magnet'
 
 const minimist = require('minimist')
 const request = require('request')
+require('request-debug')(request);
 const cheerio = require('cheerio')
+//const agent = require('http-ssh-agent')
+const agent = require('../http-ssh-agent/index')
+const fs = require('fs')
 
 const version = "magnet version: 0.1.1"
 const help = `
-Usage: magnet [--rows=N] query [index [-- pargs]]
+Usage: magnet [--tpb] [--leet] [--ssh [--user username] [--pass password] [--key keyfilepath]] [--rows=N] query [index [-- pargs]]
        magnet [-v | --version]
        magnet [-h | --help]
 
 Options:
-  query     Search query
-  index     Gets the magnet link for a particular item
-  --rows=N  Number of query results to show
-     --     Sends the magnet link to peerflix
-  pargs     Arguments for peerflix (requires -p)
+  --tpb               Use thepiratebay.org [default]
+  --leet              Use 1337x.to
+  --ssh               Send request via ssh ( in case torrent sites are blocked in your region ). If no ssh options are specified, it will look for options in ssh_
+  --host host         ssh host [ defaults to 127.0.0.1 ]
+  --port port         ssh port [ defaults to 22 ]
+  --user username     ssh username
+  --pass password     ssh password
+  --key keyfilepath   identity key file
+  query               Search query
+  index               Gets the magnet link for a particular item
+  --rows=N            Number of query results to show
+     --               Sends the magnet link to peerflix
+  pargs               Arguments for peerflix (requires -p)
 `
-const baseUrl = 'https://thepiratebay.org'
-const reqUrl = baseUrl+'/search/'
+
+const baseUrls =
+  {
+    'tpb'  : 'https://thepiratebay.org',
+    'leet' : 'https://1337x.to'
+  }
+
+const rowHandlers =
+  {
+     'tpb' : (rows) => {
+        handle(rows)
+     },
+     'leet': (rows) => {
+       var p = new Promise(function(resolve, reject) {
+        	// Do async job
+          request.get(options, function(err, resp, body) {
+              if (err) {
+                  reject(err);
+              } else {
+                  resolve(JSON.parse(body));
+              }
+          })
+      })
+     }
+  }
+
+const handlers =
+ {
+    'tpb'  :  ($, rows) => {
+      $('tr>td:nth-child(2)', 'table#searchResult').filter((i) => min <= i && i <= max).each((i, row) => {
+        rows[i] = {
+          name:   $('.detName>a', row).text(),
+          url:    $('a[href^=magnet]', row).attr('href')
+        }
+      })
+      rowHandlers['tpb'](rows)
+    },
+    'leet' : ($, rows) => {
+      $('tr>td:nth-child(1)', 'table.table-list').filter((i) => min <= i && i <= max).each((i, row) => {
+        rows[i] = {
+          name:   $('a:nth-child(2)', row).text(),
+          url:    $('a:nth-child(2)', row).attr('href')
+        }
+      })
+      rowHandlers['leet'][rows]
+    }
+
+ }
 
 let argv = minimist(process.argv.slice(2), {'--': true})
+
 if (argv.version || argv.v) {
   console.log(version)
   process.exit(0)
 }
-if (argv.help || argv.h || argv._.length < 1) {
+if (argv.help || argv.h || !argv.tpb && !argv.leet && argv._.length < 1) {
   console.log(help)
   process.exit(0)
 }
+console.log('argv', argv)
 
+
+// get base url
+const baseUrl = getbaseurl(argv)
+const reqUrl = baseUrl + "/search/"
+
+var urlKey = undefined
+//  check if ssh is enabled
+var ssh = undefined
+
+var requestObject = { gzip: true }
+
+if (typeof argv.ssh !== 'undefined' && argv.ssh) {
+  ssh = getsshobject(argv)
+}
+
+// get query
 const query = argv._[0]
-const url = reqUrl + encodeURIComponent(query)
+if (!query) {
+  console.log(help)
+  process.exit(0)
+}
+console.log('query', query);
+const url = geturl(reqUrl + query, argv)
 const max = argv._[1] || argv.rows || 5
 const min = argv._[1] || 1
 
@@ -70,21 +151,73 @@ function handle(rows) {
   }
 }
 
-request({
-  url:  url,
-  gzip: true,
-}, (error, response, body) => {
+function geturl(requrl, argv) {
+  var url = requrl
+
+  if (argv.leet) {
+    url = requrl.split(' ').join('+') + "/1/"
+
+  }
+
+  console.log('url', url);
+  return url
+}
+
+function getsshobject(argv) {
+  var sshobject
+
+  if(argv.user) {
+    var host = argv.host ? argv.host : '127.0.0.1'
+    var port = argv.port ? argv.port : 2225
+    var sshstring = `${argv.user}@${host}:2225`
+    console.log('sshstring', sshstring)
+    var sshoptions = {
+      //debug: console.log,
+      password: 'h@ckf3st' }
+
+    sshoptions['port'] = port
+
+    if (argv.key) {
+      sshoptions['privateKey'] = argv.key
+    }
+
+    if (argv.pass) {
+      sshoptions['password'] = argv.pass
+    }
+    console.log('sshoptions', sshoptions)
+    sshobject = agent(sshstring, sshoptions)
+  }
+
+  return sshobject
+}
+
+function getbaseurl(argv) {
+  var baseurl
+  var baseurl_keys = Object.keys(baseUrls)
+  baseurl_keys.forEach(function(k) {
+    if (typeof argv[k] !== 'undefined' && argv[k]) {
+      urlKey = k;
+      baseurl = baseUrls[k]
+    }
+  })
+  return baseurl
+}
+
+requestObject['url'] = url
+
+if (typeof ssh !== 'undefined') {
+  requestObject['agent'] = ssh
+}
+
+console.log('requestObject', requestObject)
+
+request(requestObject, (error, response, body) => {
+  console.log('in request callback')
   if (error) {
     console.error(error)
     return
   }
   let $ = cheerio.load(body)
   let rows = []
-  $('tr>td:nth-child(2)', 'table#searchResult').filter((i) => min <= i && i <= max).each((i, row) => {
-    rows[i] = {
-      name:   $('.detName>a', row).text(),
-      url:    $('a[href^=magnet]', row).attr('href')
-    }
-  })
-  handle(rows)
+  handlers[urlKey]($, rows)
 })
